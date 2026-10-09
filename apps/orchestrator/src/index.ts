@@ -3,27 +3,21 @@
 // shared evidence database, and this Worker only reads from it.
 
 import { runAgent, type ChatMessage, type InferResult, type ToolSchema } from './agent.js';
+import { parseAiReply, toAiTools } from './provider.js';
 import { buildTools, type QueryableDb } from './tools.js';
-
-interface WorkersAiResponse {
-  response?: string;
-  tool_calls?: Array<{ name: string; arguments: unknown }>;
-}
 
 // The generated Env type covers our bindings. The cast below widens only the
 // input shape; the call stays attached as env.AI.run(...) because the binding
 // needs its `this` at runtime. Never detach the method into a variable.
 async function workersAiInfer(env: Env, messages: ChatMessage[], schemas: ToolSchema[]): Promise<InferResult> {
   const ai = env.AI as unknown as {
-    run(model: string, input: { messages: Array<{ role: string; content: string }>; tools: ToolSchema[] }): Promise<WorkersAiResponse>;
+    run(model: string, input: { messages: Array<{ role: string; content: string }>; tools: unknown }): Promise<unknown>;
   };
   const response = await ai.run(env.MODEL, {
     messages: messages.map((message) => ({ role: message.role, content: message.content })),
-    tools: schemas,
+    tools: toAiTools(schemas),
   });
-  const call = response.tool_calls?.[0];
-  if (call) return { kind: 'tool', name: call.name, args: call.arguments };
-  return { kind: 'answer', text: response.response ?? '(the model returned no text)' };
+  return parseAiReply(response);
 }
 
 const DEFAULT_OBJECTIVE =
@@ -58,6 +52,29 @@ export default {
         console.error(JSON.stringify({ event: 'investigate.failed', error: error instanceof Error ? error.message : String(error) }));
         return Response.json({ error: 'Investigation failed', detail: error instanceof Error ? error.message : String(error) }, { status: 500 });
       }
+    }
+
+    // Temporary diagnostic endpoint. Calls inference twice — once with plain
+    // messages, once with tools attached — to isolate which half the model
+    // rejects. Remove before Day 7.
+    if (request.method === 'POST' && url.pathname === '/probe') {
+      const ai = env.AI as unknown as { run(model: string, input: unknown): Promise<unknown> };
+      const messages = [{ role: 'user', content: 'Reply with the word OK.' }];
+      const results: Record<string, unknown> = {};
+      try {
+        results.plain = await ai.run(env.MODEL, { messages });
+      } catch (error) {
+        results.plainError = error instanceof Error ? error.message : String(error);
+      }
+      try {
+        results.withTools = await ai.run(env.MODEL, {
+          messages,
+          tools: buildTools(env.incident_evidence as unknown as QueryableDb).map((tool) => tool.schema),
+        });
+      } catch (error) {
+        results.withToolsError = error instanceof Error ? error.message : String(error);
+      }
+      return Response.json(results);
     }
 
     return Response.json({ error: 'Route not found' }, { status: 404 });
