@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "incident-orchestrator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "MODEL": "@cf/ibm-granite/granite-4.0-h-micro",
+    "MAX_STEPS": "8"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "incident_evidence",
+      "database_name": "incident-evidence",
+      "database_id": "f44ad014-a8d8-4d7e-8fc2-03f62136f77a"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "incident-quote-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "INCIDENT_VARIANT": "healthy",
+    "RELEASE_LABEL": "healthy-01"
+  },
+  "d1_databases": [
+    {
+      "binding": "incident_evidence",
+      "database_name": "incident-evidence",
+      "database_id": "f44ad014-a8d8-4d7e-8fc2-03f62136f77a"
+    }
+  ]
+}

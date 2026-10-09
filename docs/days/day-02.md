@@ -1,0 +1,63 @@
+# Day 2 — Evidence store, then one incident agent
+
+## Part A — Queryable evidence (groundwork)
+
+Workers Logs served Day 1 manual inspection. Agents need a stable table with a fixed shape. D1 holds two tables defined in `infra/d1/schema.sql`:
+
+- `deployments`: one row per Worker deployment (version ID, release label, variant, deploy time, traffic share). Recorded by hand after each deploy.
+- `quote_events`: one row per attempted quote request (time, server request ID, order type, HTTP status, release label, error or transport failure).
+
+`scripts/traffic.mjs` accepts an optional fifth argument, a path for a SQL record file. It parses each HTTP response body for the server's `requestId` and `release`, so a recorded row links the client's observation to the server's log entry. Transport failures are recorded with a NULL status, never silently dropped.
+
+### Your WSL steps (run in `apps/incident-api/`)
+
+1. Create the database:
+
+   ```sh
+   npx wrangler d1 create incident-evidence
+   ```
+
+   Copy the `database_id` into the observations below.
+
+2. Apply the schema:
+
+   ```sh
+   npx wrangler d1 execute incident-evidence --remote --file=../../infra/d1/schema.sql
+   ```
+
+3. Read the exact deploy times from the dashboard (**Workers & Pages → incident-quote-api → Deployments**, hover each entry), then record all three Day 1 deployments:
+
+   ```sh
+   npx wrangler d1 execute incident-evidence --remote --command="INSERT INTO deployments (version_id, release_label, variant, deployed_at, traffic_percent) VALUES ('3e9e73ee-88fa-409e-9ea7-3632fb8a23f3', 'healthy-01', 'healthy', '<HEALTHY_DEPLOY_TIME>', 0), ('14ba0d70-d62f-4281-a3b6-bbcc4d357eef', 'broken-02', 'broken', '<BROKEN_DEPLOY_TIME>', 0), ('a4f9a86f-df57-4e5a-9bb5-a3a49773b3ed', 'healthy-01', 'healthy', '<RESTORE_DEPLOY_TIME>', 100)"
+   ```
+
+   Times must come from the dashboard, not from memory. Use ISO format (`2026-10-09T12:15:53Z`).
+
+4. Record a fresh healthy traffic sample from the project root:
+
+   ```sh
+   node scripts/traffic.mjs https://incident-quote-api.samuelumoren365.workers.dev 3 1000 /tmp/quote-events.sql
+   npx wrangler d1 execute incident-evidence --remote --file=/tmp/quote-events.sql
+   ```
+
+   The second command runs from `apps/incident-api/`. Verify with:
+
+   ```sh
+   npx wrangler d1 execute incident-evidence --remote --command="SELECT release_label, http_status, COUNT(*) FROM quote_events GROUP BY release_label, http_status"
+   ```
+
+## Observations
+
+- D1 database name and ID: `incident-evidence`, `f44ad014-a8d8-4d7e-8fc2-03f62136f77a` (region WEUR, created 2026-10-09 on Samuel's personal account); binding `incident_evidence` added to both Worker configs for Day 2 tools
+- Schema applied 2026-10-09: 4 queries executed (deployments, quote_events, 2 indexes), database size 0.04 MB.
+- Deployments rows recorded: all three Day 1 versions with dashboard-sourced timestamps (healthy `3e9e73ee` 2026-10-07T16:21:12.316Z, broken `14ba0d70` 2026-10-07T16:37:03.397Z, healthy restore `a4f9a86f` 2026-10-09T12:47:48.980Z), each at 100% traffic during its window.
+- Traffic sample recorded (cycles, counts, time window): 3 cycles against the restored healthy Worker, 15 HTTP 200, zero failures; SQL file applied as 15 queries.
+- Verification query result: `healthy-01 | 200 | 15` — matches the traffic run exactly. Part A complete.
+
+## Part B — One incident agent (in progress)
+
+`apps/orchestrator/` holds a second Worker with the AI and D1 bindings. `runAgent()` (injected inference), read-only tools (`queryQuoteEvents`, `getErrorRate`, `listDeployments`), and a `POST /investigate` endpoint are built. Six loop tests pass: direct answer, tool success, tool failure as observation, unknown tool as observation, step limit, and repeated-call stop. Live model test pending (deploy + POST against the real tables).
+
+First live POST returned 1101 (Worker threw). Tail showed `TypeError: Cannot set properties of undefined (setting '#options')` inside the AI binding: `workersAiInfer` had detached `env.AI.run` into a standalone function, losing its `this`. Fixed by casting the input shape instead and keeping the call attached as `ai.run(...)`. Also wrapped the investigate handler so future exceptions return structured JSON instead of an HTML error page. Lesson: bindings are objects with internal state — call their methods attached, the same rule as never destructuring `ctx`.
+
+Second failure: the configured model `@hf/nousresearch/hermes-2-pro-mistral-7b` was deprecated on 2026-05-30 (Workers AI returned error 5028, now surfaced as structured JSON thanks to the handler fix). Switched `MODEL` to `@cf/ibm-granite/granite-4.0-h-micro`, whose catalog page confirms function calling support, Cloudflare hosting, and low unit pricing. Lesson: model names are dependencies that rot — the catalog, not old docs, is the source of truth, and keeping the name in config made the switch a one-line change.
