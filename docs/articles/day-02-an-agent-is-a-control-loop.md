@@ -18,10 +18,18 @@ A tool has five parts. Each one exists because the model is an unreliable caller
 
 **4. An implementation that validates.** The function body checks its own inputs and throws meaningful errors. `queryQuoteEvents` rejects any order type but `standard` or `priority`; `getErrorRate` returns `null` — not zero — when no request completed, because "no data" is not "no errors." Every tool in this system runs `SELECT` and nothing else, enforced by keeping all three in one short file that can be audited at a glance. Validation is where domain honesty lives: the Day 1 lesson about incomplete traffic cycles is now a SQL expression.
 
+One boundary sits beside validation: the provider layer decodes the model's stringified arguments (sometimes doubly encoded) before the tool ever sees them. Forgiveness at the transport boundary, strictness at the domain boundary. The tool still accepts objects only — it just never has to deal with packaging quirks.
+
 **5. A result envelope.** Every tool returns the same shape: `{ ok: true, output }` or `{ ok: false, error }`. The model never sees a stack trace and never faces a crash — a failed database call arrives as a sentence it can read ("D1 is unreachable"), and the tested behavior is an honest "I cannot conclude" instead of invented numbers.
+
+## What the anatomy cannot do
+
+The live test humbled the design. Over a store holding 30 requests with 6 real HTTP 500s, the agent twice queried only the healthy slice — events filtered to `standard`, all 200s — and twice concluded that "all recorded failures are standard." False: the bug fails priority orders. The loop worked, every tool returned `ok: true`, and the conclusion was still unsupported. A correct mechanism with real tools produced a confident error, complete with the self-contradicting line "100% success" beside "6 returned HTTP 5xx."
+
+So the anatomy is necessary and not sufficient. It guarantees the investigation ends honestly about *how* it ended. It does not guarantee the model looked at the right rows. Nothing in Day 2 checks a conclusion against the evidence behind it — that verification step is the subject of Day 5, and this failure is the reason it exists.
 
 ## Why the anatomy matters more than the model
 
-During this build the configured model was deprecated mid-week and replaced with a one-line config change. Nothing in the loop or the tools cared. Models are interchangeable tenants; the tool contract is the building. An agent's reliability comes from five unglamorous decisions — names, descriptions, schemas, validation, and envelopes — that turn an unreliable caller into a supervised investigator.
+During this build the configured model was deprecated mid-week and replaced with a one-line config change. Nothing in the loop or the tools cared. Models are interchangeable tenants; the tool contract is the building. An agent's reliability comes from five unglamorous decisions — names, descriptions, schemas, validation, and envelopes — that turn an unreliable caller into a supervised investigator. The remaining gap is not in the tools but above them: someone must check the work.
 
 The operating principle: **the model proposes, the tool disposes, and the loop guarantees it always ends with the truth about how it ended.**

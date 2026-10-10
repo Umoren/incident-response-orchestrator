@@ -3,6 +3,7 @@
 // shared evidence database, and this Worker only reads from it.
 
 import { runAgent, type ChatMessage, type InferResult, type ToolSchema } from './agent.js';
+import { buildDelegateTool } from './delegate.js';
 import { parseAiReply, toAiTools } from './provider.js';
 import { buildTools, type QueryableDb } from './tools.js';
 
@@ -21,7 +22,7 @@ async function workersAiInfer(env: Env, messages: ChatMessage[], schemas: ToolSc
 }
 
 const DEFAULT_OBJECTIVE =
-  'Investigate the current incident: determine whether quote failures are occurring, which order types and deployments are affected, and what the evidence supports. End with what is known, what is uncertain, and what should happen next.';
+  'Investigate the current incident and end with what is known, what is uncertain, and what should happen next. Work through specialists: delegate a telemetry slice (error counts and failing requests, using queryQuoteEvents and getErrorRate) and a deployment slice (version timeline, using listDeployments) to separate workers, giving each only the context and tools its task needs. Then combine their conclusions with the deployment timeline into one assessment. Check every major claim against the evidence before stating it.';
 
 export default {
   async fetch(request, env): Promise<Response> {
@@ -40,12 +41,18 @@ export default {
       }
       const maxSteps = Number(env.MAX_STEPS ?? 8);
       try {
+        const db = env.incident_evidence as unknown as QueryableDb;
+        const readTools = buildTools(db);
+        const infer = (messages: ChatMessage[], schemas: ToolSchema[]) => workersAiInfer(env, messages, schemas);
+        // The parent alone receives `delegate`. Workers are built inside the
+        // delegate tool from readTools only, so depth stops at 1 structurally.
+        const parentTools = [...readTools, buildDelegateTool({ infer, allTools: readTools })];
         const report = await runAgent({
           objective: typeof body.objective === 'string' ? body.objective : DEFAULT_OBJECTIVE,
           context: typeof body.context === 'string' ? body.context : undefined,
-          tools: buildTools(env.incident_evidence as unknown as QueryableDb),
+          tools: parentTools,
           maxSteps: Number.isInteger(body.maxSteps) ? body.maxSteps : maxSteps,
-          infer: (messages, schemas) => workersAiInfer(env, messages, schemas),
+          infer,
         });
         return Response.json(report);
       } catch (error) {
