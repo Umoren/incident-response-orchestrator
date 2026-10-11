@@ -37,12 +37,24 @@ export interface AgentReport {
   messages: ChatMessage[];
 }
 
+export interface ToolResultEvent {
+  step: number;
+  tool: string;
+  args: unknown;
+  ok: boolean;
+  output?: unknown;
+  error?: string;
+}
+
 export interface RunAgentOptions {
   objective: string;
   context?: string;
   tools: AgentTool[];
   maxSteps?: number;
   infer: (messages: ChatMessage[], tools: ToolSchema[]) => Promise<InferResult>;
+  // Called after every tool call. Lets the orchestrator write history down
+  // without changing how the loop behaves.
+  onToolResult?: (event: ToolResultEvent) => void | Promise<void>;
 }
 
 function callKey(name: string, args: unknown): string {
@@ -102,12 +114,15 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentReport> {
     try {
       const output = await tool.run(decision.args);
       messages.push({ role: 'tool', name: decision.name, content: JSON.stringify({ ok: true, output }) });
+      await options.onToolResult?.({ step, tool: decision.name, args: decision.args, ok: true, output });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       messages.push({
         role: 'tool',
         name: decision.name,
-        content: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+        content: JSON.stringify({ ok: false, error: message }),
       });
+      await options.onToolResult?.({ step, tool: decision.name, args: decision.args, ok: false, error: message });
     }
   }
 

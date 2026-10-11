@@ -4,7 +4,9 @@
 
 import { runAgent, type ChatMessage, type InferResult, type ToolSchema } from './agent.js';
 import { buildDelegateTool } from './delegate.js';
+import { runIncident } from './orchestrate.js';
 import { parseAiReply, toAiTools } from './provider.js';
+import { D1IncidentStore, type DbExecutor } from './store.js';
 import { buildTools, type QueryableDb } from './tools.js';
 
 // The generated Env type covers our bindings. The cast below widens only the
@@ -82,6 +84,55 @@ export default {
         results.withToolsError = error instanceof Error ? error.message : String(error);
       }
       return Response.json(results);
+    }
+
+    // One alert in, concurrent investigation out. The same dedupeKey twice
+    // points at the existing incident instead of starting a new run.
+    if (request.method === 'POST' && url.pathname === '/incident') {
+      let body: { dedupeKey?: string; objective?: string; context?: string; timeoutMs?: number } = {};
+      try {
+        body = (await request.json()) as typeof body;
+      } catch {
+        return Response.json({ error: 'Send a JSON body' }, { status: 400 });
+      }
+      if (typeof body.dedupeKey !== 'string' || body.dedupeKey.length === 0) {
+        return Response.json({ error: 'dedupeKey is required' }, { status: 400 });
+      }
+      try {
+        const db = env.incident_evidence as unknown as QueryableDb & DbExecutor;
+        const readTools = buildTools(db);
+        const infer = (messages: ChatMessage[], schemas: ToolSchema[]) => workersAiInfer(env, messages, schemas);
+        const store = new D1IncidentStore(db);
+        const context = typeof body.context === 'string' ? body.context : undefined;
+        const result = await runIncident({
+          store,
+          infer,
+          readTools,
+          objective: typeof body.objective === 'string' ? body.objective : DEFAULT_OBJECTIVE,
+          context,
+          dedupeKey: body.dedupeKey,
+          slices: [
+            {
+              key: 'telemetry',
+              task: 'Telemetry slice: count errors and list failing requests in the given window.',
+              context,
+              tools: ['queryQuoteEvents', 'getErrorRate'],
+            },
+            {
+              key: 'deployment',
+              task: 'Deployment slice: list the version timeline covering the given window.',
+              context,
+              tools: ['listDeployments'],
+            },
+          ],
+          defaultTimeoutMs: Number.isInteger(body.timeoutMs) ? body.timeoutMs : 120_000,
+        });
+        const agents = result.runId ? await store.listAgents(result.runId) : [];
+        return Response.json({ ...result, agents });
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'incident.failed', error: error instanceof Error ? error.message : String(error) }));
+        return Response.json({ error: 'Incident run failed', detail: error instanceof Error ? error.message : String(error) }, { status: 500 });
+      }
     }
 
     return Response.json({ error: 'Route not found' }, { status: 404 });
