@@ -23,6 +23,7 @@ export interface WorkerSlice {
 
 export interface WorkerOutcome {
   key: string;
+  taskId: string;
   agentId: string;
   status: 'succeeded' | 'failed' | 'timed_out';
   stepsUsed: number | null;
@@ -35,6 +36,8 @@ export interface IncidentResult {
   deduplicated: boolean;
   workers: WorkerOutcome[];
   runStatus: RunState | 'duplicate';
+  executionMode: 'sequential' | 'concurrent';
+  elapsedMs: number;
 }
 
 export interface OrchestrateOptions {
@@ -46,22 +49,37 @@ export interface OrchestrateOptions {
   dedupeKey: string;
   slices: WorkerSlice[];
   defaultTimeoutMs?: number;
+  executionMode?: 'sequential' | 'concurrent';
 }
 
-function lateTimeout(ms: number): Promise<never> {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error(`Worker timed out after ${ms}ms`)), ms);
+function withTimeout<T>(operation: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Worker timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
   });
 }
 
 export async function runIncident(options: OrchestrateOptions): Promise<IncidentResult> {
+  const startedAt = Date.now();
   const now = () => new Date().toISOString();
   const { store, infer, readTools, objective, context, dedupeKey, slices } = options;
   const timeoutMs = options.defaultTimeoutMs ?? 120_000;
+  const executionMode = options.executionMode ?? 'concurrent';
 
   const existing = await store.findIncidentByDedupe(dedupeKey);
   if (existing) {
-    return { incidentId: existing.incident_id, runId: null, deduplicated: true, workers: [], runStatus: 'duplicate' };
+    return {
+      incidentId: existing.incident_id,
+      runId: null,
+      deduplicated: true,
+      workers: [],
+      runStatus: 'duplicate',
+      executionMode,
+      elapsedMs: Date.now() - startedAt,
+    };
   }
 
   const incidentId = crypto.randomUUID();
@@ -71,23 +89,37 @@ export async function runIncident(options: OrchestrateOptions): Promise<Incident
 
   const parentId = crypto.randomUUID();
   await store.createAgent(
-    { agent_id: parentId, run_id: runId, role: 'parent', task: objective, parent_agent_id: null },
+    { agent_id: parentId, run_id: runId, task_id: null, role: 'parent', task: objective, parent_agent_id: null },
     now(),
   );
   await store.setAgentState(parentId, 'running', now());
 
-  const flights = slices.map(async (slice): Promise<WorkerOutcome> => {
+  // A task is the durable unit of work. An agent is one attempt to execute it.
+  // Create all tasks first so queued work is visible before execution begins.
+  const prepared: Array<{ slice: WorkerSlice; taskId: string; agentId: string }> = [];
+  for (const slice of slices) {
+    const taskId = crypto.randomUUID();
     const agentId = crypto.randomUUID();
-    await store.createAgent(
-      { agent_id: agentId, run_id: runId, role: 'worker', task: slice.task, parent_agent_id: parentId },
+    await store.createTask(
+      { task_id: taskId, run_id: runId, task_key: slice.key, description: slice.task },
       now(),
     );
+    await store.createAgent(
+      { agent_id: agentId, run_id: runId, task_id: taskId, role: 'worker', task: slice.task, parent_agent_id: parentId },
+      now(),
+    );
+    prepared.push({ slice, taskId, agentId });
+  }
+
+  const runWorker = async ({ slice, taskId, agentId }: (typeof prepared)[number]): Promise<WorkerOutcome> => {
+    await store.setTaskState(taskId, 'running', now());
     await store.setAgentState(agentId, 'running', now());
 
     const subset = readTools.filter((tool) => slice.tools.includes(tool.schema.name));
     if (subset.length === 0) {
+      await store.finishTask(taskId, 'failed', now());
       await store.finishAgent(agentId, 'failed', null, 'No valid tools selected for this worker.', now());
-      return { key: slice.key, agentId, status: 'failed', stepsUsed: null, conclusion: 'No valid tools selected for this worker.' };
+      return { key: slice.key, taskId, agentId, status: 'failed', stepsUsed: null, conclusion: 'No valid tools selected for this worker.' };
     }
 
     const recordCall = async (event: { step: number; tool: string; args: unknown; ok: boolean; output?: unknown; error?: string }) => {
@@ -106,7 +138,7 @@ export async function runIncident(options: OrchestrateOptions): Promise<Incident
     };
 
     try {
-      const report = await Promise.race([
+      const report = await withTimeout(
         runAgent({
           objective: slice.task,
           context: slice.context ?? context,
@@ -115,26 +147,49 @@ export async function runIncident(options: OrchestrateOptions): Promise<Incident
           infer,
           onToolResult: recordCall,
         }),
-        lateTimeout(slice.timeoutMs ?? timeoutMs),
-      ]);
+        slice.timeoutMs ?? timeoutMs,
+      );
       const status = report.status === 'answered' ? 'succeeded' : 'failed';
+      await store.finishTask(taskId, status, now());
       await store.finishAgent(agentId, status, report.stepsUsed, report.finalAnswer, now());
-      return { key: slice.key, agentId, status, stepsUsed: report.stepsUsed, conclusion: report.finalAnswer };
+      return { key: slice.key, taskId, agentId, status, stepsUsed: report.stepsUsed, conclusion: report.finalAnswer };
     } catch (error) {
       const timedOut = error instanceof Error && error.message.includes('timed out');
       const status = timedOut ? 'timed_out' : 'failed';
       const note = error instanceof Error ? error.message : String(error);
+      await store.finishTask(taskId, status, now());
       await store.finishAgent(agentId, status, null, note, now());
-      return { key: slice.key, agentId, status, stepsUsed: null, conclusion: note };
+      return { key: slice.key, taskId, agentId, status, stepsUsed: null, conclusion: note };
     }
-  });
+  };
 
-  // Every worker settles — success or failure — before the run is graded.
-  const settled = await Promise.allSettled(flights);
+  let settled: PromiseSettledResult<WorkerOutcome>[];
+  if (executionMode === 'sequential') {
+    settled = [];
+    for (const item of prepared) {
+      try {
+        settled.push({ status: 'fulfilled', value: await runWorker(item) });
+      } catch (reason) {
+        settled.push({ status: 'rejected', reason });
+      }
+    }
+  } else {
+    // Every worker settles — success or failure — before the run is graded.
+    settled = await Promise.allSettled(prepared.map(runWorker));
+  }
+
   const workers = settled.map((entry, index): WorkerOutcome => {
     const slice = slices[index] as WorkerSlice;
+    const item = prepared[index];
     if (entry.status === 'fulfilled') return entry.value;
-    return { key: slice.key, agentId: 'unknown', status: 'failed', stepsUsed: null, conclusion: String(entry.reason) };
+    return {
+      key: slice.key,
+      taskId: item?.taskId ?? 'unknown',
+      agentId: item?.agentId ?? 'unknown',
+      status: 'failed',
+      stepsUsed: null,
+      conclusion: String(entry.reason),
+    };
   });
 
   const succeeded = workers.filter((worker) => worker.status === 'succeeded').length;
@@ -142,5 +197,13 @@ export async function runIncident(options: OrchestrateOptions): Promise<Incident
   await store.finishRun(runId, runStatus, now());
   await store.finishAgent(parentId, runStatus === 'failed' ? 'failed' : 'succeeded', null, null, now());
 
-  return { incidentId, runId, deduplicated: false, workers, runStatus };
+  return {
+    incidentId,
+    runId,
+    deduplicated: false,
+    workers,
+    runStatus,
+    executionMode,
+    elapsedMs: Date.now() - startedAt,
+  };
 }

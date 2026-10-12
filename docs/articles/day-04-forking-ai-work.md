@@ -8,7 +8,7 @@ One `Promise.allSettled()` carries the whole idea: both workers launch together,
 
 ## State makes the system inspectable
 
-Four tables now record the investigation the way an airline records a flight: incidents (one row per alert, with a unique dedupe key), runs (one row per attempt), agents (parent plus workers, each moving `queued → running → succeeded/failed/timed_out/cancelled`), and every tool call with its arguments and outcome. The duplicate-alert drill proved the transitions stay consistent: the same key twice produced one incident, one run, and zero new model calls. Doubt anything in a report and two queries reproduce who did what and how each task ended — independently of the report itself.
+Five tables now record the investigation the way an airline records a flight: incidents (one row per alert, with a unique dedupe key), runs (one row per attempt), tasks (the durable work assigned during that attempt), agents (the parent and each execution attempt, moving `queued → running → succeeded/failed/timed_out/cancelled`), and every tool call with its arguments and outcome. Keeping tasks separate from agents gives retries a stable target: a new agent can attempt the same task without pretending it is new work. The duplicate-alert drill proved the outer identity stays consistent: the same key twice produced one incident, one run, and zero new model calls.
 
 ## Bounded work, honestly labeled
 

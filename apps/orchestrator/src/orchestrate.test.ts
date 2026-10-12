@@ -67,6 +67,31 @@ test('independent workers overlap in time', async () => {
   assert.ok(Math.max(...starts) < Math.min(...ends), 'workers did not overlap');
 });
 
+test('concurrent execution is faster than the sequential baseline', async () => {
+  const sequential = await runIncident({
+    store: new MemoryIncidentStore(),
+    infer: answerAfterTools('done'),
+    readTools: fakeTools([]),
+    objective: 'Investigate',
+    dedupeKey: 'timing-sequential',
+    slices,
+    executionMode: 'sequential',
+  });
+  const concurrent = await runIncident({
+    store: new MemoryIncidentStore(),
+    infer: answerAfterTools('done'),
+    readTools: fakeTools([]),
+    objective: 'Investigate',
+    dedupeKey: 'timing-concurrent',
+    slices,
+    executionMode: 'concurrent',
+  });
+  assert.equal(sequential.executionMode, 'sequential');
+  assert.equal(concurrent.executionMode, 'concurrent');
+  assert.ok(sequential.elapsedMs >= 180, `sequential run was unexpectedly short: ${sequential.elapsedMs}ms`);
+  assert.ok(concurrent.elapsedMs < sequential.elapsedMs, `${concurrent.elapsedMs}ms was not faster than ${sequential.elapsedMs}ms`);
+});
+
 test('one worker failing does not sink the other', async () => {
   const store = new MemoryIncidentStore();
   const infer = async (messages: ChatMessage[], tools: ToolSchema[]): Promise<InferResult> => {
@@ -151,4 +176,9 @@ test('every tool call is written down under its agent', async () => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.tool_name, 'getErrorRate');
   assert.equal(calls[0]?.ok, true);
+  const tasks = await store.listTasks(result.runId as string);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0]?.task_id, result.workers[0]?.taskId);
+  assert.notEqual(tasks[0]?.task_id, workerId);
+  assert.equal(tasks[0]?.status, 'succeeded');
 });

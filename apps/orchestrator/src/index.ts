@@ -89,7 +89,13 @@ export default {
     // One alert in, concurrent investigation out. The same dedupeKey twice
     // points at the existing incident instead of starting a new run.
     if (request.method === 'POST' && url.pathname === '/incident') {
-      let body: { dedupeKey?: string; objective?: string; context?: string; timeoutMs?: number } = {};
+      let body: {
+        dedupeKey?: string;
+        objective?: string;
+        context?: string;
+        timeoutMs?: number;
+        executionMode?: 'sequential' | 'concurrent';
+      } = {};
       try {
         body = (await request.json()) as typeof body;
       } catch {
@@ -97,6 +103,9 @@ export default {
       }
       if (typeof body.dedupeKey !== 'string' || body.dedupeKey.length === 0) {
         return Response.json({ error: 'dedupeKey is required' }, { status: 400 });
+      }
+      if (body.executionMode && !['sequential', 'concurrent'].includes(body.executionMode)) {
+        return Response.json({ error: 'executionMode must be sequential or concurrent' }, { status: 400 });
       }
       try {
         const db = env.incident_evidence as unknown as QueryableDb & DbExecutor;
@@ -126,9 +135,12 @@ export default {
             },
           ],
           defaultTimeoutMs: Number.isInteger(body.timeoutMs) ? body.timeoutMs : 120_000,
+          executionMode: body.executionMode ?? 'concurrent',
         });
-        const agents = result.runId ? await store.listAgents(result.runId) : [];
-        return Response.json({ ...result, agents });
+        const [tasks, agents] = result.runId
+          ? await Promise.all([store.listTasks(result.runId), store.listAgents(result.runId)])
+          : [[], []];
+        return Response.json({ ...result, tasks, agents });
       } catch (error) {
         console.error(JSON.stringify({ event: 'incident.failed', error: error instanceof Error ? error.message : String(error) }));
         return Response.json({ error: 'Incident run failed', detail: error instanceof Error ? error.message : String(error) }, { status: 500 });

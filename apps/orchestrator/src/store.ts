@@ -16,12 +16,21 @@ export interface IncidentRow {
 export interface AgentRow {
   agent_id: string;
   run_id: string;
+  task_id: string | null;
   role: 'parent' | 'worker';
   task: string;
   status: AgentState;
   parent_agent_id: string | null;
   steps_used: number | null;
   conclusion: string | null;
+}
+
+export interface TaskRow {
+  task_id: string;
+  run_id: string;
+  task_key: string;
+  description: string;
+  status: AgentState;
 }
 
 export interface ToolCallRow {
@@ -39,10 +48,14 @@ export interface IncidentStore {
   createIncident(incidentId: string, dedupeKey: string, objective: string, now: string): Promise<void>;
   createRun(runId: string, incidentId: string, now: string): Promise<void>;
   finishRun(runId: string, status: RunState, now: string): Promise<void>;
+  createTask(task: Omit<TaskRow, 'status'>, now: string): Promise<void>;
+  setTaskState(taskId: string, status: AgentState, now: string): Promise<void>;
+  finishTask(taskId: string, status: AgentState, now: string): Promise<void>;
   createAgent(agent: Omit<AgentRow, 'status' | 'steps_used' | 'conclusion'>, now: string): Promise<void>;
   setAgentState(agentId: string, status: AgentState, now: string): Promise<void>;
   finishAgent(agentId: string, status: AgentState, stepsUsed: number | null, conclusion: string | null, now: string): Promise<void>;
   recordToolCall(call: ToolCallRow, now: string): Promise<void>;
+  listTasks(runId: string): Promise<TaskRow[]>;
   listAgents(runId: string): Promise<AgentRow[]>;
 }
 
@@ -89,10 +102,31 @@ export class D1IncidentStore implements IncidentStore {
       .run();
   }
 
+  async createTask(task: Omit<TaskRow, 'status'>, now: string): Promise<void> {
+    await this.db
+      .prepare("INSERT INTO tasks (task_id, run_id, task_key, description, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)")
+      .bind(task.task_id, task.run_id, task.task_key, task.description, now)
+      .run();
+  }
+
+  async setTaskState(taskId: string, status: AgentState, now: string): Promise<void> {
+    await this.db
+      .prepare('UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?) WHERE task_id = ?')
+      .bind(status, now, taskId)
+      .run();
+  }
+
+  async finishTask(taskId: string, status: AgentState, now: string): Promise<void> {
+    await this.db
+      .prepare('UPDATE tasks SET status = ?, finished_at = ? WHERE task_id = ?')
+      .bind(status, now, taskId)
+      .run();
+  }
+
   async createAgent(agent: Omit<AgentRow, 'status' | 'steps_used' | 'conclusion'>, now: string): Promise<void> {
     await this.db
-      .prepare("INSERT INTO agents (agent_id, run_id, role, task, status, parent_agent_id, created_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)")
-      .bind(agent.agent_id, agent.run_id, agent.role, agent.task, agent.parent_agent_id, now)
+      .prepare("INSERT INTO agents (agent_id, run_id, task_id, role, task, status, parent_agent_id, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)")
+      .bind(agent.agent_id, agent.run_id, agent.task_id, agent.role, agent.task, agent.parent_agent_id, now)
       .run();
   }
 
@@ -120,9 +154,17 @@ export class D1IncidentStore implements IncidentStore {
 
   async listAgents(runId: string): Promise<AgentRow[]> {
     const { results } = await this.db
-      .prepare('SELECT agent_id, run_id, role, task, status, parent_agent_id, steps_used, conclusion FROM agents WHERE run_id = ?')
+      .prepare('SELECT agent_id, run_id, task_id, role, task, status, parent_agent_id, steps_used, conclusion FROM agents WHERE run_id = ?')
       .bind(runId)
       .all<AgentRow>();
+    return results;
+  }
+
+  async listTasks(runId: string): Promise<TaskRow[]> {
+    const { results } = await this.db
+      .prepare('SELECT task_id, run_id, task_key, description, status FROM tasks WHERE run_id = ?')
+      .bind(runId)
+      .all<TaskRow>();
     return results;
   }
 }
@@ -131,6 +173,7 @@ export class D1IncidentStore implements IncidentStore {
 export class MemoryIncidentStore implements IncidentStore {
   incidents = new Map<string, IncidentRow>();
   runs = new Map<string, { run_id: string; incident_id: string; status: RunState }>();
+  tasks = new Map<string, TaskRow>();
   agents = new Map<string, AgentRow>();
   toolCalls: Array<ToolCallRow & { created_at: string }> = [];
 
@@ -152,6 +195,20 @@ export class MemoryIncidentStore implements IncidentStore {
   async finishRun(runId: string, status: RunState): Promise<void> {
     const run = this.runs.get(runId);
     if (run) run.status = status;
+  }
+
+  async createTask(task: Omit<TaskRow, 'status'>): Promise<void> {
+    this.tasks.set(task.task_id, { ...task, status: 'queued' });
+  }
+
+  async setTaskState(taskId: string, status: AgentState): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (task) task.status = status;
+  }
+
+  async finishTask(taskId: string, status: AgentState): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (task) task.status = status;
   }
 
   async createAgent(agent: Omit<AgentRow, 'status' | 'steps_used' | 'conclusion'>): Promise<void> {
@@ -178,5 +235,9 @@ export class MemoryIncidentStore implements IncidentStore {
 
   async listAgents(runId: string): Promise<AgentRow[]> {
     return [...this.agents.values()].filter((agent) => agent.run_id === runId);
+  }
+
+  async listTasks(runId: string): Promise<TaskRow[]> {
+    return [...this.tasks.values()].filter((task) => task.run_id === runId);
   }
 }
