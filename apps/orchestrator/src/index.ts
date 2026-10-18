@@ -136,6 +136,7 @@ export default {
           ],
           defaultTimeoutMs: Number.isInteger(body.timeoutMs) ? body.timeoutMs : 120_000,
           executionMode: body.executionMode ?? 'concurrent',
+          evidenceDb: db,
         });
         const [tasks, agents] = result.runId
           ? await Promise.all([store.listTasks(result.runId), store.listAgents(result.runId)])

@@ -43,6 +43,22 @@ export interface ToolCallRow {
   error_text: string | null;
 }
 
+export interface VerdictRow {
+  run_id: string;
+  task_id: string;
+  agent_id: string;
+  worker_key: string;
+  claim: string;
+  kind: 'request_row' | 'aggregate' | 'deployment';
+  status: 'verified' | 'contradicted' | 'not_found' | 'uncheckable';
+  detail: string | null;
+}
+
+export interface RunVerification {
+  confidence: number | null;
+  assessmentJson: string;
+}
+
 export interface IncidentStore {
   findIncidentByDedupe(dedupeKey: string): Promise<IncidentRow | null>;
   createIncident(incidentId: string, dedupeKey: string, objective: string, now: string): Promise<void>;
@@ -55,6 +71,8 @@ export interface IncidentStore {
   setAgentState(agentId: string, status: AgentState, now: string): Promise<void>;
   finishAgent(agentId: string, status: AgentState, stepsUsed: number | null, conclusion: string | null, now: string): Promise<void>;
   recordToolCall(call: ToolCallRow, now: string): Promise<void>;
+  recordVerdict(verdict: VerdictRow, now: string): Promise<void>;
+  setRunVerification(runId: string, verification: RunVerification, now: string): Promise<void>;
   listTasks(runId: string): Promise<TaskRow[]>;
   listAgents(runId: string): Promise<AgentRow[]>;
 }
@@ -160,6 +178,32 @@ export class D1IncidentStore implements IncidentStore {
     return results;
   }
 
+  async recordVerdict(verdict: VerdictRow, now: string): Promise<void> {
+    await this.db
+      .prepare(
+        'INSERT INTO claim_verdicts (run_id, task_id, agent_id, worker_key, claim, kind, status, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .bind(
+        verdict.run_id,
+        verdict.task_id,
+        verdict.agent_id,
+        verdict.worker_key,
+        verdict.claim,
+        verdict.kind,
+        verdict.status,
+        verdict.detail,
+        now,
+      )
+      .run();
+  }
+
+  async setRunVerification(runId: string, verification: RunVerification, now: string): Promise<void> {
+    await this.db
+      .prepare('UPDATE runs SET confidence = ?, assessment_json = ?, finished_at = COALESCE(finished_at, ?) WHERE run_id = ?')
+      .bind(verification.confidence, verification.assessmentJson, now, runId)
+      .run();
+  }
+
   async listTasks(runId: string): Promise<TaskRow[]> {
     const { results } = await this.db
       .prepare('SELECT task_id, run_id, task_key, description, status FROM tasks WHERE run_id = ?')
@@ -172,10 +216,11 @@ export class D1IncidentStore implements IncidentStore {
 // Memory version for tests. Same rules, no database.
 export class MemoryIncidentStore implements IncidentStore {
   incidents = new Map<string, IncidentRow>();
-  runs = new Map<string, { run_id: string; incident_id: string; status: RunState }>();
+  runs = new Map<string, { run_id: string; incident_id: string; status: RunState; confidence?: number | null; assessmentJson?: string }>();
   tasks = new Map<string, TaskRow>();
   agents = new Map<string, AgentRow>();
   toolCalls: Array<ToolCallRow & { created_at: string }> = [];
+  verdicts: Array<VerdictRow & { created_at: string }> = [];
 
   async findIncidentByDedupe(dedupeKey: string): Promise<IncidentRow | null> {
     for (const incident of this.incidents.values()) {
@@ -231,6 +276,18 @@ export class MemoryIncidentStore implements IncidentStore {
 
   async recordToolCall(call: ToolCallRow, now: string): Promise<void> {
     this.toolCalls.push({ ...call, created_at: now });
+  }
+
+  async recordVerdict(verdict: VerdictRow, now: string): Promise<void> {
+    this.verdicts.push({ ...verdict, created_at: now });
+  }
+
+  async setRunVerification(runId: string, verification: RunVerification): Promise<void> {
+    const run = this.runs.get(runId);
+    if (run) {
+      run.confidence = verification.confidence;
+      run.assessmentJson = verification.assessmentJson;
+    }
   }
 
   async listAgents(runId: string): Promise<AgentRow[]> {
